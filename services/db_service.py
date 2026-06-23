@@ -1,9 +1,9 @@
 import os
 import psycopg2
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 import psycopg2
 # Tải các biến môi trường từ file .env
-load_dotenv()
+# load_dotenv()
 
 # Lấy chuỗi kết nối từ file .env
 # DB_URL = os.environ.get("DATABASE_URL")
