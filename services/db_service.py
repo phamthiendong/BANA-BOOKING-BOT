@@ -8,6 +8,12 @@ load_dotenv()
 # Lấy chuỗi kết nối từ file .env
 # DB_URL = os.environ.get("DATABASE_URL")
 
+# def get_connection():
+#     """Tạo kết nối tới PostgreSQL"""
+#     if not DB_URL:
+#         raise ValueError("❌ CHƯA CÓ DATABASE_URL! Hãy thêm vào file .env nhé.")
+#     return psycopg2.connect(DB_URL)
+
 def get_connection():
     db_url = os.getenv("DATABASE_URL")
 
@@ -16,12 +22,6 @@ def get_connection():
 
     return psycopg2.connect(db_url)
 
-
-def get_connection():
-    """Tạo kết nối tới PostgreSQL"""
-    if not DB_URL:
-        raise ValueError("❌ CHƯA CÓ DATABASE_URL! Hãy thêm vào file .env nhé.")
-    return psycopg2.connect(DB_URL)
 
 def init_db():
     """Tạo bảng nếu chưa tồn tại (Chỉ chạy 1 lần lúc bật tool)"""
