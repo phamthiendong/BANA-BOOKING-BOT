@@ -19,30 +19,7 @@ CREDENTIALS_PATH = os.path.join(BASE_DIR, "config", "credentials.json")
 TOKEN_PATH = os.path.join(BASE_DIR, "data", "token.json")
 
 
-def ensure_google_auth_files():
-    os.makedirs(os.path.dirname(CREDENTIALS_PATH), exist_ok=True)
-    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
-
-    credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
-    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
-
-    print("GOOGLE_CREDENTIALS_JSON =", bool(credentials_json))
-    print("GOOGLE_TOKEN_JSON =", bool(token_json))
-
-    if credentials_json:
-        with open(CREDENTIALS_PATH, "w", encoding="utf-8") as f:
-            f.write(credentials_json)
-
-    if token_json:
-        with open(TOKEN_PATH, "w", encoding="utf-8") as f:
-            f.write(token_json)
-
-
-
-
 def get_google_service(api_name, api_version):
-
-    ensure_google_auth_files()  # ✅ Phải gọi TRƯỚC, tạo file xong mới đọc
     creds = None
     if os.path.exists(TOKEN_PATH):
         creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
@@ -221,4 +198,17 @@ def get_realtime_emails():
     return emails
 
 
+def ensure_google_auth_files():
+    os.makedirs(os.path.dirname(CREDENTIALS_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(TOKEN_PATH), exist_ok=True)
 
+    credentials_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    token_json = os.environ.get("GOOGLE_TOKEN_JSON")
+
+    if credentials_json:
+        with open(CREDENTIALS_PATH, "w", encoding="utf-8") as f:
+            f.write(credentials_json)
+
+    if token_json:
+        with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+            f.write(token_json)
