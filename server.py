@@ -1,22 +1,582 @@
+# import os
+# import re
+# import time
+# import threading
+# import calendar
+# from datetime import datetime, timedelta
+# from contextlib import asynccontextmanager
+
+# from fastapi import FastAPI, BackgroundTasks, HTTPException
+# from fastapi.middleware.cors import CORSMiddleware
+# from pydantic import BaseModel
+
+# from services.gmail_service import get_realtime_emails, get_google_service
+# from services.gmail_service import extract_body_from_payload, get_header_value, build_gmail_link
+# from services.booking_parser import parse_booking_email
+# from services.sheet_service import (
+#     setup_header,
+#     append_booking,
+#     create_sheet_if_not_exists,
+#     update_sheet_booking_status,
+# )
+# from services.db_service import (
+#     init_db,
+#     cleanup_old_data,
+#     check_booking_exists,
+#     insert_booking,
+#     update_booking_status,
+# )
+
+# # ================================================================
+# # TRẠNG THÁI TOÀN CỤC (thay thế cho input() console)
+# # ================================================================
+# state = {
+#     "sheet_id": None,
+#     "sheet_month": None,
+#     "sheet_year": None,
+#     "new_sheet_pending": None,
+#     "so_ngay": 5,
+#     "ngay_bat_dau": None,       # datetime object
+#     "dang_chay": False,          # Giai đoạn 2 đang chạy không
+#     "dang_quet_bu": False,       # Giai đoạn 1 đang chạy không
+#     "realtime_thread": None,
+#     "dang_tam_dung": False,     # TÍNH NĂNG MỚI: Nút Tạm dừng
+#     # Thống kê
+#     "tong_moi": 0,
+#     "tong_huy": 0,
+#     "tong_bo_qua": 0,
+#     "lan_quet_cuoi": None,
+#     "log": [],                   # Log 100 dòng gần nhất
+# }
+
+# LOT_SIZE = 15
+# NGHI_GIUA_LOT = 2
+# NGHI_GIUA_NGAY = 3
+# REALTIME_INTERVAL = 600  # 10 phút
+
+# # ================================================================
+# # HELPERS
+# # ================================================================
+# def add_log(msg: str):
+#     ts = datetime.now().strftime("%H:%M:%S")
+#     line = f"[{ts}] {msg}"
+#     print(line)
+#     state["log"].append(line)
+#     if len(state["log"]) > 200:
+#         state["log"] = state["log"][-200:]
+
+# def extract_sheet_id(url_or_id: str) -> str:
+#     match = re.search(r"/d/([a-zA-Z0-9-_]+)", url_or_id)
+#     return match.group(1) if match else url_or_id.strip()
+
+# def get_last_day_of_month(year, month):
+#     return calendar.monthrange(year, month)[1]
+
+# def get_danh_sach_ngay(ngay_bat_dau: datetime, so_ngay: int):
+#     return [(ngay_bat_dau + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(so_ngay)]
+
+# def tinh_danh_sach_ngay_realtime():
+#     """Tính cửa sổ ngày trượt cho Giai đoạn 2."""
+#     today = datetime.now()
+#     so_ngay = state["so_ngay"]
+#     sheet_month = state["sheet_month"]
+#     sheet_year = state["sheet_year"]
+#     ngay_bat_dau = state["ngay_bat_dau"]
+
+#     last_day = get_last_day_of_month(sheet_year, sheet_month)
+#     last_date_of_month = datetime(sheet_year, sheet_month, last_day)
+#     start_date = max(today, ngay_bat_dau)
+
+#     result = []
+#     for i in range(so_ngay):
+#         d = start_date + timedelta(days=i)
+#         if d > last_date_of_month:
+#             break
+#         result.append(d.strftime("%Y-%m-%d"))
+#     return result
+
+# # ================================================================
+# # XỬ LÝ 1 EMAIL
+# # ================================================================
+
+# def process_email(email, danh_sach_ngay, sheet_id, pha="realtime"):
+#     """
+#     Logic xử lý 1 email:
+
+#     EMAIL CONFIRMED:
+#       - Chưa có DB          → ghi DB (BOOKED)   + ghi Sheets          ✅ MỚI
+#       - Đã có DB BOOKED     → bỏ qua                                   ⏭️
+#       - Đã có DB CANCELLED  → cập nhật DB→BOOKED + cập nhật Sheets     🔄 PHỤC HỒI
+
+#     EMAIL CANCELLED:
+#       - Chưa có DB          → ghi DB (CANCELLED) + ghi Sheets + HỦY VÉ 🔴 HỦY SỚM
+#       - Đã có DB CANCELLED  → bỏ qua                                    ⏭️
+#       - Đã có DB BOOKED     → cập nhật DB→CANCELLED + cập nhật Sheets  🔴 HỦY VÉ
+
+#     Trả về: "moi" | "huy" | "phuc_hoi" | "bo_qua" | "loi"
+#     """
+#     try:
+#         booking = parse_booking_email(email)
+#         code = booking.get("code", "").upper()
+#         if not code:
+#             return "loi"
+
+#         ngay_di = booking.get("service_date", "").strip()
+#         if ngay_di not in danh_sach_ngay:
+#             return "bo_qua"
+
+#         ngay_obj = datetime.strptime(ngay_di, "%Y-%m-%d")
+#         tab = f"{ngay_obj.day}.{ngay_obj.month}"
+#         is_cancel = "cancel" in email.get("subject", "").lower()
+
+#         # Kiểm tra DB
+#         is_exist, current_status = check_booking_exists(code)
+
+#         # ============================================================
+#         # TRƯỜNG HỢP: EMAIL CANCELLED
+#         # ============================================================
+#         if is_cancel:
+#             if not is_exist:
+#                 # Chưa có trong DB → ghi mới với trạng thái CANCELLED
+#                 insert_booking(code, ngay_di, status="CANCELLED")
+#                 append_booking(booking, sheet_id, tab)
+#                 update_sheet_booking_status(sheet_id, tab, code, "HỦY VÉ")
+#                 print(f"🔴 [{pha.upper()}][HỦY SỚM - CHƯA CÓ DB] [{code}] → Tab {tab}")
+#                 return "huy"
+
+#             elif current_status == "CANCELLED":
+#                 # Đã CANCELLED rồi → bỏ qua
+#                 print(f"⏭️  [{pha.upper()}][ĐÃ HỦY RỒI - BỎ QUA] [{code}]")
+#                 return "bo_qua"
+
+#             else:
+#                 # Đang BOOKED → chuyển sang CANCELLED
+#                 update_booking_status(code, "CANCELLED")
+#                 update_sheet_booking_status(sheet_id, tab, code, "HỦY VÉ")
+#                 print(f"🔴 [{pha.upper()}][HỦY VÉ - CẬP NHẬT] [{code}] BOOKED→CANCELLED → Tab {tab}")
+#                 return "huy"
+
+#         # ============================================================
+#         # TRƯỜNG HỢP: EMAIL CONFIRMED
+#         # ============================================================
+#         else:
+#             if not is_exist:
+#                 # Chưa có trong DB → ghi mới BOOKED
+#                 ok = insert_booking(code, ngay_di, status="BOOKED")
+#                 if ok:
+#                     append_booking(booking, sheet_id, tab)
+#                     print(f"✅ [{pha.upper()}][ĐƠN MỚI] [{code}] ngày {ngay_di} → Tab {tab}")
+#                     return "moi"
+#                 return "loi"
+
+#             elif current_status == "BOOKED":
+#                 # Đã BOOKED rồi → bỏ qua
+#                 print(f"⏭️  [{pha.upper()}][ĐÃ CÓ DB - BỎ QUA] [{code}]")
+#                 return "bo_qua"
+
+#             else:
+#                 # Trước đó đã CANCELLED, giờ có CONFIRMED → phục hồi lại
+#                 update_booking_status(code, "BOOKED")
+#                 update_sheet_booking_status(sheet_id, tab, code, "ĐÃ ĐẶT LẠI")
+#                 print(f"🔄 [{pha.upper()}][PHỤC HỒI] [{code}] CANCELLED→BOOKED → Tab {tab}")
+#                 return "phuc_hoi"
+
+#     except Exception as e:
+#         print(f"⚠️ Lỗi process_email [{pha}]: {e}")
+#         return "loi"
+
+
+# # ================================================================
+# # GIAI ĐOẠN 1 — QUÉT BÙ THEO LÔ (chạy trong background thread)
+# # ================================================================
+# def lay_danh_sach_id_email(target_date):
+#     service = get_google_service("gmail", "v1")
+#     query = (
+#         f'from:operator@klook.com '
+#         f'(subject:"Klook order confirmed" OR subject:"Klook order canceled") '
+#         f'subject:(Fast Track) subject:({target_date})'
+#     )
+#     all_ids, next_page_token = [], None
+#     while True:
+#         result = service.users().messages().list(
+#             userId="me", maxResults=500, q=query, pageToken=next_page_token
+#         ).execute()
+#         all_ids.extend(result.get("messages", []))
+#         next_page_token = result.get("nextPageToken")
+#         if not next_page_token:
+#             break
+#     return all_ids
+
+# def tai_chi_tiet_mot_email(service, msg_id):
+#     try:
+#         msg_data = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+#         payload = msg_data.get("payload", {})
+#         headers = payload.get("headers", [])
+#         mid = msg_data.get("id", "")
+#         return {
+#             "message_id": mid,
+#             "thread_id": msg_data.get("threadId", ""),
+#             "from": get_header_value(headers, "From"),
+#             "subject": get_header_value(headers, "Subject"),
+#             "date": get_header_value(headers, "Date"),
+#             "snippet": msg_data.get("snippet", ""),
+#             "body": extract_body_from_payload(payload),
+#             "email_link": build_gmail_link(mid),
+#         }
+#     except Exception as e:
+#         add_log(f"⚠️ Lỗi tải email {msg_id}: {e}")
+#         return None
+
+# def chay_quet_bu():
+#     """Giai đoạn 1 — chạy trong background thread."""
+#     state["dang_quet_bu"] = True
+#     sheet_id = state["sheet_id"]
+#     danh_sach_ngay = get_danh_sach_ngay(state["ngay_bat_dau"], state["so_ngay"])
+#     tong_moi = tong_huy = tong_bo_qua = 0
+
+#     add_log(f"🚀 [GIAI ĐOẠN 1] Bắt đầu quét bù {len(danh_sach_ngay)} ngày...")
+
+#     for idx, ngay in enumerate(danh_sach_ngay, 1):
+#         ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
+#         tab = f"{ngay_obj.day}.{ngay_obj.month}"
+#         add_log(f"📅 [{idx}/{len(danh_sach_ngay)}] Ngày {ngay} → Tab '{tab}'")
+
+#         create_sheet_if_not_exists(sheet_id, tab)
+#         setup_header(sheet_id, tab)
+
+#         ids = lay_danh_sach_id_email(ngay)
+#         add_log(f"  🔍 Tìm thấy {len(ids)} email.")
+#         if not ids:
+#             continue
+
+#         service = get_google_service("gmail", "v1")
+#         tong_ids = len(ids)
+#         so_lot = (tong_ids + LOT_SIZE - 1) // LOT_SIZE
+
+#         for so_lot_idx, start in enumerate(range(0, tong_ids, LOT_SIZE), 1):
+#             lot = ids[start: start + LOT_SIZE]
+#             add_log(f"  📦 Lô {so_lot_idx}/{so_lot} ({len(lot)} email)...")
+#             dm = dh = db = 0
+#             for msg in lot:
+#                 email = tai_chi_tiet_mot_email(service, msg["id"])
+#                 if not email:
+#                     db += 1
+#                     continue
+#                 r = process_email(email, [ngay], sheet_id, "quet_bu")
+#                 if r == "moi": dm += 1
+#                 elif r == "huy": dh += 1
+#                 else: db += 1
+#             add_log(f"    ✅ Lô xong: Mới={dm} | Hủy={dh} | Bỏ qua={db}")
+#             tong_moi += dm; tong_huy += dh; tong_bo_qua += db
+#             if start + LOT_SIZE < tong_ids:
+#                 time.sleep(NGHI_GIUA_LOT)
+
+#         if idx < len(danh_sach_ngay):
+#             time.sleep(NGHI_GIUA_NGAY)
+
+#     state["tong_moi"] += tong_moi
+#     state["tong_huy"] += tong_huy
+#     state["tong_bo_qua"] += tong_bo_qua
+#     state["dang_quet_bu"] = False
+#     add_log(f"✅ [GIAI ĐOẠN 1 XONG] Mới={tong_moi} | Hủy={tong_huy} | Bỏ qua={tong_bo_qua}")
+
+#     # Tự động chuyển sang Giai đoạn 2 sau khi quét bù xong
+#     chay_realtime_loop()
+
+# # ================================================================
+# # GIAI ĐOẠN 2 — REALTIME LOOP (chạy mãi trong background thread)
+# # ================================================================
+# def chay_realtime_loop():
+#     state["dang_chay"] = True
+#     add_log("🟢 [GIAI ĐOẠN 2] Realtime bắt đầu (10 phút/lần)...")
+
+#     while state["dang_chay"]:
+
+#         # THÊM ĐOẠN NÀY VÀO ĐẦU VÒNG LẶP:
+#         if state.get("dang_tam_dung", False):
+#             # Nếu đang bị tạm dừng, ngủ 10 giây rồi quay lại check tiếp
+#             time.sleep(1000)
+#             continue
+
+#         try:
+#             today = datetime.now()
+#             cleanup_old_data(days_to_keep=30)
+
+#             # Áp dụng link tháng mới nếu đến tháng
+#             pending = state["new_sheet_pending"]
+#             if pending and today.month == pending["month"] and today.year == pending["year"]:
+#                 state["sheet_id"] = pending["sheet_id"]
+#                 state["sheet_month"] = pending["month"]
+#                 state["sheet_year"] = pending["year"]
+#                 state["new_sheet_pending"] = None
+#                 add_log(f"🎉 Chuyển sang tháng {pending['month']}/{pending['year']} thành công!")
+
+#             # Kiểm tra hết tháng
+#             if today.month != state["sheet_month"] or today.year != state["sheet_year"]:
+#                 add_log("🛑 Đã sang tháng mới! Cần cập nhật link Sheets qua API /config/sheet-moi")
+#                 time.sleep(60)
+#                 continue
+
+#             danh_sach_ngay = tinh_danh_sach_ngay_realtime()
+#             sheet_id = state["sheet_id"]
+
+#             # Tạo tab nếu chưa có
+#             for ngay in danh_sach_ngay:
+#                 ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
+#                 tab = f"{ngay_obj.day}.{ngay_obj.month}"
+#                 create_sheet_if_not_exists(sheet_id, tab)
+#                 setup_header(sheet_id, tab)
+
+#             add_log(f"📡 Quét realtime... Vùng: {', '.join(danh_sach_ngay)}")
+#             emails = get_realtime_emails()
+#             add_log(f"  📧 {len(emails)} email mới trong 10 phút qua.")
+
+#             dm = dh = db = 0
+#             for email in emails:
+#                 r = process_email(email, danh_sach_ngay, sheet_id, "realtime")
+#                 if r == "moi": dm += 1
+#                 elif r == "huy": dh += 1
+#                 else: db += 1
+
+#             state["tong_moi"] += dm
+#             state["tong_huy"] += dh
+#             state["tong_bo_qua"] += db
+#             state["lan_quet_cuoi"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#             add_log(f"  ✔️  Kết quả: Mới={dm} | Hủy={dh} | Bỏ qua={db}")
+#             add_log(f"  ⏱️  Chờ 10 phút...")
+
+#             time.sleep(REALTIME_INTERVAL)
+
+#         except Exception as e:
+#             add_log(f"⚠️ Lỗi realtime: {e}. Thử lại sau 10 phút...")
+#             time.sleep(REALTIME_INTERVAL)
+
+# # ================================================================
+# # FASTAPI APP
+# # ================================================================
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     init_db()
+#     add_log("✅ Database khởi tạo xong. Sẵn sàng nhận lệnh qua API.")
+#     yield
+#     state["dang_chay"] = False
+#     add_log("🛑 Server tắt an toàn.")
+
+# app = FastAPI(
+#     title="BANA Booking Bot API",
+#     description="API quản lý quét Gmail Klook & ghi Google Sheets",
+#     version="2.0.0",
+#     lifespan=lifespan,
+# )
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=["*"],
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # ================================================================
+# # SCHEMAS
+# # ================================================================
+# class KhoiDongBody(BaseModel):
+#     sheet_link: str
+#     ngay_bat_dau: str   # YYYY-MM-DD
+#     so_ngay: int = 5    # 1-5
+
+# class SheetMoiBody(BaseModel):
+#     sheet_link: str
+
+# # ================================================================
+# # ENDPOINTS
+# # ================================================================
+
+# @app.get("/", summary="Kiểm tra server sống")
+# def root():
+#     return {"status": "ok", "message": "BANA Booking Bot đang chạy 🤖"}
+
+
+# @app.post("/khoi-dong", summary="Khởi động bot (Giai đoạn 1 + 2)")
+# def khoi_dong(body: KhoiDongBody, background_tasks: BackgroundTasks):
+#     """
+#     Khởi động toàn bộ bot:
+#     1. Nhận link Sheets, ngày bắt đầu, số ngày quét
+#     2. Chạy Giai đoạn 1 (quét bù) trong background
+#     3. Tự động chuyển sang Giai đoạn 2 (realtime 10 phút) sau khi xong
+#     """
+#     if state["dang_chay"] or state["dang_quet_bu"]:
+#         raise HTTPException(status_code=400, detail="Bot đang chạy rồi! Dùng /dung để tắt trước.")
+
+#     try:
+#         ngay_bat_dau_obj = datetime.strptime(body.ngay_bat_dau.replace("/", "-"), "%Y-%m-%d")
+#     except ValueError:
+#         raise HTTPException(status_code=400, detail="Sai định dạng ngày! Dùng YYYY-MM-DD")
+
+#     if not 1 <= body.so_ngay <= 5:
+#         raise HTTPException(status_code=400, detail="so_ngay phải từ 1 đến 5")
+
+#     state["sheet_id"] = extract_sheet_id(body.sheet_link)
+#     state["sheet_month"] = ngay_bat_dau_obj.month
+#     state["sheet_year"] = ngay_bat_dau_obj.year
+#     state["ngay_bat_dau"] = ngay_bat_dau_obj
+#     state["so_ngay"] = body.so_ngay
+#     state["tong_moi"] = state["tong_huy"] = state["tong_bo_qua"] = 0
+#     state["log"] = []
+
+#     t = threading.Thread(target=chay_quet_bu, daemon=True)
+#     t.start()
+#     state["realtime_thread"] = t
+
+#     return {
+#         "status": "started",
+#         "sheet_id": state["sheet_id"],
+#         "ngay_bat_dau": body.ngay_bat_dau,
+#         "so_ngay": body.so_ngay,
+#         "message": "Giai đoạn 1 (quét bù) đang chạy. Tự chuyển sang Realtime khi xong."
+#     }
+
+
+# @app.post("/dung", summary="Dừng bot Giai đoạn 2 (Realtime)")
+# def dung_bot():
+#     if not state["dang_chay"]:
+#         raise HTTPException(status_code=400, detail="Bot chưa chạy.")
+#     state["dang_chay"] = False
+#     return {"status": "stopped", "message": "Đã gửi lệnh dừng. Bot sẽ dừng sau chu kỳ hiện tại."}
+
+
+# @app.get("/trang-thai", summary="Xem trạng thái hiện tại của bot")
+# def trang_thai():
+#     return {
+#         "dang_quet_bu": state["dang_quet_bu"],
+#         "dang_chay_realtime": state["dang_chay"],
+#         "sheet_id": state["sheet_id"],
+#         "sheet_thang_nam": f"{state['sheet_month']}/{state['sheet_year']}" if state["sheet_month"] else None,
+#         "ngay_bat_dau": state["ngay_bat_dau"].strftime("%Y-%m-%d") if state["ngay_bat_dau"] else None,
+#         "so_ngay": state["so_ngay"],
+#         "thong_ke": {
+#             "tong_don_moi": state["tong_moi"],
+#             "tong_huy": state["tong_huy"],
+#             "tong_bo_qua": state["tong_bo_qua"],
+#         },
+#         "lan_quet_cuoi": state["lan_quet_cuoi"],
+#         "link_sheets_moi_cho": state["new_sheet_pending"]["sheet_id"] if state["new_sheet_pending"] else None,
+#     }
+
+
+# @app.get("/log", summary="Xem 100 dòng log gần nhất")
+# def xem_log(n: int = 100):
+#     return {"log": state["log"][-n:]}
+
+
+# @app.post("/config/sheet-moi", summary="Cập nhật link Sheets tháng mới")
+# def cap_nhat_sheet_moi(body: SheetMoiBody):
+#     """
+#     Đăng ký link Sheets cho tháng tiếp theo.
+#     Bot sẽ tự động chuyển sang link này khi sang tháng mới.
+#     """
+#     if not state["sheet_month"]:
+#         raise HTTPException(status_code=400, detail="Bot chưa khởi động.")
+
+#     cur_month = state["sheet_month"]
+#     cur_year = state["sheet_year"]
+#     next_month = 1 if cur_month == 12 else cur_month + 1
+#     next_year = cur_year + 1 if cur_month == 12 else cur_year
+
+#     new_id = extract_sheet_id(body.sheet_link)
+#     if new_id == state["sheet_id"]:
+#         raise HTTPException(status_code=400, detail="Đây là link cũ! Nhập link của tháng mới.")
+
+#     state["new_sheet_pending"] = {
+#         "sheet_id": new_id,
+#         "month": next_month,
+#         "year": next_year,
+#     }
+#     add_log(f"📋 Đã đăng ký link Sheets mới cho tháng {next_month}/{next_year}")
+#     return {
+#         "status": "ok",
+#         "message": f"Link đã lưu. Sẽ kích hoạt tự động khi sang tháng {next_month}/{next_year}.",
+#         "sheet_id_moi": new_id,
+#     }
+
+
+# @app.post("/quet-ngay", summary="Quét thủ công 1 ngày cụ thể")
+# def quet_thu_cong(ngay: str, background_tasks: BackgroundTasks):
+#     """
+#     Quét bù thủ công cho 1 ngày bất kỳ (YYYY-MM-DD).
+#     Hữu ích khi muốn đồng bộ lại 1 ngày bị thiếu.
+#     """
+#     if not state["sheet_id"]:
+#         raise HTTPException(status_code=400, detail="Bot chưa được khởi động. Gọi /khoi-dong trước.")
+#     try:
+#         datetime.strptime(ngay, "%Y-%m-%d")
+#     except ValueError:
+#         raise HTTPException(status_code=400, detail="Sai định dạng ngày! Dùng YYYY-MM-DD")
+
+#     def _quet():
+#         sheet_id = state["sheet_id"]
+#         ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
+#         tab = f"{ngay_obj.day}.{ngay_obj.month}"
+#         create_sheet_if_not_exists(sheet_id, tab)
+#         setup_header(sheet_id, tab)
+#         ids = lay_danh_sach_id_email(ngay)
+#         add_log(f"🔧 [QUÉT THỦ CÔNG] Ngày {ngay}: {len(ids)} email")
+#         if not ids:
+#             return
+#         service = get_google_service("gmail", "v1")
+#         for msg in ids:
+#             email = tai_chi_tiet_mot_email(service, msg["id"])
+#             if email:
+#                 process_email(email, [ngay], sheet_id, "thu_cong")
+
+#     background_tasks.add_task(_quet)
+#     return {"status": "queued", "ngay": ngay, "message": f"Đang quét ngày {ngay} trong nền..."}
+
+# @app.post("/tam-dung", summary="Tạm dừng bot tạm thời")
+# def tam_dung():
+#     """Tạm ngưng quét email nhưng không tắt hẳn server."""
+#     if not state["dang_chay"]:
+#         raise HTTPException(status_code=400, detail="Bot chưa khởi động.")
+#     if state.get("dang_tam_dung"):
+#         return {"status": "already_paused", "message": "Bot ĐÃ đang trong trạng thái tạm dừng."}
+    
+#     state["dang_tam_dung"] = True
+#     add_log("⏸️ Đã nhận lệnh TẠM DỪNG. Bot đang ngủ đông chờ lệnh tiếp tục...")
+#     return {"status": "paused", "message": "Đã tạm dừng bot thành công."}
+
+
+# @app.post("/tiep-tuc", summary="Tiếp tục chạy bot")
+# def tiep_tuc():
+#     """Đánh thức bot dậy sau khi tạm dừng."""
+#     if not state["dang_chay"]:
+#         raise HTTPException(status_code=400, detail="Bot đã bị tắt hoàn toàn. Vui lòng dùng /khoi-dong.")
+#     if not state.get("dang_tam_dung"):
+#         return {"status": "already_running", "message": "Bot đang chạy bình thường, không bị tạm dừng."}
+    
+#     state["dang_tam_dung"] = False
+#     add_log("▶️ Đã nhận lệnh TIẾP TỤC. Bot bắt đầu làm việc lại.")
+#     return {"status": "resumed", "message": "Bot đã thức dậy và tiếp tục quét."}
+
+
+
+
+
+
+
 import os
 import re
 import time
-import threading
 import calendar
 from datetime import datetime, timedelta
-from typing import Optional
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import asyncio
-import json
 
-# ================================================================
-# IMPORT TỪ CÁC SERVICE CỦA BẠN
-# ================================================================
-from services.gmail_service import get_emails_by_date, get_realtime_emails
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from services.gmail_service import get_realtime_emails, get_google_service
+from services.gmail_service import extract_body_from_payload, get_header_value, build_gmail_link
 from services.booking_parser import parse_booking_email
 from services.sheet_service import (
     setup_header,
@@ -33,542 +593,587 @@ from services.db_service import (
 )
 
 # ================================================================
-# KHỞI TẠO APP
+# TRẠNG THÁI TOÀN CỤC
 # ================================================================
-app = FastAPI(title="Klook Scanner API")
+state = {
+    "sheet_id": None,
+    "sheet_month": None,
+    "sheet_year": None,
+    "new_sheet_pending": None,
+    "so_ngay": 5,
+    "ngay_bat_dau": None,
+    "dang_quet_bu": False,       # Giai đoạn 1 đang chạy không
+    # Thống kê
+    "tong_moi": 0,
+    "tong_huy": 0,
+    "tong_bo_qua": 0,
+    "lan_quet_cuoi": None,
+    "log": [],
+}
+
+LOT_SIZE = 15
+NGHI_GIUA_LOT = 2
+NGHI_GIUA_NGAY = 3
+REALTIME_INTERVAL_MINUTES = 10  # APScheduler dùng đơn vị phút
+
+# ================================================================
+# APSCHEDULER — Quản lý Giai đoạn 2
+# ================================================================
+# Mỗi job chạy trong thread riêng, tối đa 1 job realtime cùng lúc
+scheduler = BackgroundScheduler(
+    job_defaults={"coalesce": True, "max_instances": 1},
+)
+REALTIME_JOB_ID = "realtime_scan"
+
+# ================================================================
+# HELPERS
+# ================================================================
+def add_log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    state["log"].append(line)
+    if len(state["log"]) > 200:
+        state["log"] = state["log"][-200:]
+
+def extract_sheet_id(url_or_id: str) -> str:
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url_or_id)
+    return match.group(1) if match else url_or_id.strip()
+
+def get_last_day_of_month(year, month):
+    return calendar.monthrange(year, month)[1]
+
+def get_danh_sach_ngay(ngay_bat_dau: datetime, so_ngay: int):
+    return [(ngay_bat_dau + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(so_ngay)]
+
+def tinh_danh_sach_ngay_realtime():
+    """Tính cửa sổ ngày trượt cho Giai đoạn 2."""
+    today = datetime.now()
+    so_ngay = state["so_ngay"]
+    sheet_month = state["sheet_month"]
+    sheet_year = state["sheet_year"]
+    ngay_bat_dau = state["ngay_bat_dau"]
+
+    last_day = get_last_day_of_month(sheet_year, sheet_month)
+    last_date_of_month = datetime(sheet_year, sheet_month, last_day)
+    start_date = max(today, ngay_bat_dau)
+
+    result = []
+    for i in range(so_ngay):
+        d = start_date + timedelta(days=i)
+        if d > last_date_of_month:
+            break
+        result.append(d.strftime("%Y-%m-%d"))
+    return result
+
+def is_realtime_running() -> bool:
+    """Kiểm tra job realtime có đang được lên lịch không."""
+    job = scheduler.get_job(REALTIME_JOB_ID)
+    return job is not None
+
+# ================================================================
+# XỬ LÝ 1 EMAIL
+# ================================================================
+def process_email(email, danh_sach_ngay, sheet_id, pha="realtime"):
+    """
+    EMAIL CONFIRMED:
+      - Chưa có DB          → ghi DB (BOOKED)   + ghi Sheets          ✅ MỚI
+      - Đã có DB BOOKED     → bỏ qua                                   ⏭️
+      - Đã có DB CANCELLED  → cập nhật DB→BOOKED + cập nhật Sheets     🔄 PHỤC HỒI
+
+    EMAIL CANCELLED:
+      - Chưa có DB          → ghi DB (CANCELLED) + ghi Sheets + HỦY VÉ 🔴 HỦY SỚM
+      - Đã có DB CANCELLED  → bỏ qua                                    ⏭️
+      - Đã có DB BOOKED     → cập nhật DB→CANCELLED + cập nhật Sheets  🔴 HỦY VÉ
+
+    Trả về: "moi" | "huy" | "phuc_hoi" | "bo_qua" | "loi"
+    """
+    try:
+        booking = parse_booking_email(email)
+        code = booking.get("code", "").upper()
+        if not code:
+            return "loi"
+
+        ngay_di = booking.get("service_date", "").strip()
+        if ngay_di not in danh_sach_ngay:
+            return "bo_qua"
+
+        ngay_obj = datetime.strptime(ngay_di, "%Y-%m-%d")
+        tab = f"{ngay_obj.day}.{ngay_obj.month}"
+        is_cancel = "cancel" in email.get("subject", "").lower()
+
+        is_exist, current_status = check_booking_exists(code)
+
+        if is_cancel:
+            if not is_exist:
+                insert_booking(code, ngay_di, status="CANCELLED")
+                append_booking(booking, sheet_id, tab)
+                update_sheet_booking_status(sheet_id, tab, code, "HỦY VÉ")
+                add_log(f"🔴 [{pha.upper()}][HỦY SỚM] [{code}] → Tab {tab}")
+                return "huy"
+            elif current_status == "CANCELLED":
+                return "bo_qua"
+            else:
+                update_booking_status(code, "CANCELLED")
+                update_sheet_booking_status(sheet_id, tab, code, "HỦY VÉ")
+                add_log(f"🔴 [{pha.upper()}][HỦY VÉ] [{code}] BOOKED→CANCELLED → Tab {tab}")
+                return "huy"
+        else:
+            if not is_exist:
+                ok = insert_booking(code, ngay_di, status="BOOKED")
+                if ok:
+                    append_booking(booking, sheet_id, tab)
+                    add_log(f"✅ [{pha.upper()}][ĐƠN MỚI] [{code}] ngày {ngay_di} → Tab {tab}")
+                    return "moi"
+                return "loi"
+            elif current_status == "BOOKED":
+                return "bo_qua"
+            else:
+                update_booking_status(code, "BOOKED")
+                update_sheet_booking_status(sheet_id, tab, code, "ĐÃ ĐẶT LẠI")
+                add_log(f"🔄 [{pha.upper()}][PHỤC HỒI] [{code}] CANCELLED→BOOKED → Tab {tab}")
+                return "phuc_hoi"
+
+    except Exception as e:
+        add_log(f"⚠️ Lỗi process_email [{pha}]: {e}")
+        return "loi"
+
+
+# ================================================================
+# GIAI ĐOẠN 1 — QUÉT BÙ (chạy 1 lần trong background thread)
+# ================================================================
+def lay_danh_sach_id_email(target_date):
+    service = get_google_service("gmail", "v1")
+    query = (
+        f'from:operator@klook.com '
+        f'(subject:"Klook order confirmed" OR subject:"Klook order canceled") '
+        f'subject:(Fast Track) subject:({target_date})'
+    )
+    all_ids, next_page_token = [], None
+    while True:
+        result = service.users().messages().list(
+            userId="me", maxResults=500, q=query, pageToken=next_page_token
+        ).execute()
+        all_ids.extend(result.get("messages", []))
+        next_page_token = result.get("nextPageToken")
+        if not next_page_token:
+            break
+    return all_ids
+
+def tai_chi_tiet_mot_email(service, msg_id):
+    try:
+        msg_data = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+        payload = msg_data.get("payload", {})
+        headers = payload.get("headers", [])
+        mid = msg_data.get("id", "")
+        return {
+            "message_id": mid,
+            "thread_id": msg_data.get("threadId", ""),
+            "from": get_header_value(headers, "From"),
+            "subject": get_header_value(headers, "Subject"),
+            "date": get_header_value(headers, "Date"),
+            "snippet": msg_data.get("snippet", ""),
+            "body": extract_body_from_payload(payload),
+            "email_link": build_gmail_link(mid),
+        }
+    except Exception as e:
+        add_log(f"⚠️ Lỗi tải email {msg_id}: {e}")
+        return None
+
+def chay_quet_bu():
+    """Giai đoạn 1 — chạy 1 lần duy nhất khi gọi /quet-bu."""
+    state["dang_quet_bu"] = True
+    sheet_id = state["sheet_id"]
+    danh_sach_ngay = get_danh_sach_ngay(state["ngay_bat_dau"], state["so_ngay"])
+    tong_moi = tong_huy = tong_bo_qua = 0
+
+    add_log(f"🚀 [GIAI ĐOẠN 1] Bắt đầu quét bù {len(danh_sach_ngay)} ngày...")
+
+    for idx, ngay in enumerate(danh_sach_ngay, 1):
+        ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
+        tab = f"{ngay_obj.day}.{ngay_obj.month}"
+        add_log(f"📅 [{idx}/{len(danh_sach_ngay)}] Ngày {ngay} → Tab '{tab}'")
+
+        create_sheet_if_not_exists(sheet_id, tab)
+        setup_header(sheet_id, tab)
+
+        ids = lay_danh_sach_id_email(ngay)
+        add_log(f"  🔍 Tìm thấy {len(ids)} email.")
+        if not ids:
+            continue
+
+        service = get_google_service("gmail", "v1")
+        tong_ids = len(ids)
+        so_lot = (tong_ids + LOT_SIZE - 1) // LOT_SIZE
+
+        for so_lot_idx, start in enumerate(range(0, tong_ids, LOT_SIZE), 1):
+            lot = ids[start: start + LOT_SIZE]
+            add_log(f"  📦 Lô {so_lot_idx}/{so_lot} ({len(lot)} email)...")
+            dm = dh = db = 0
+            for msg in lot:
+                email = tai_chi_tiet_mot_email(service, msg["id"])
+                if not email:
+                    db += 1
+                    continue
+                r = process_email(email, [ngay], sheet_id, "quet_bu")
+                if r == "moi": dm += 1
+                elif r == "huy": dh += 1
+                else: db += 1
+            add_log(f"    ✅ Lô xong: Mới={dm} | Hủy={dh} | Bỏ qua={db}")
+            tong_moi += dm; tong_huy += dh; tong_bo_qua += db
+            if start + LOT_SIZE < tong_ids:
+                time.sleep(NGHI_GIUA_LOT)
+
+        if idx < len(danh_sach_ngay):
+            time.sleep(NGHI_GIUA_NGAY)
+
+    state["tong_moi"] += tong_moi
+    state["tong_huy"] += tong_huy
+    state["tong_bo_qua"] += tong_bo_qua
+    state["dang_quet_bu"] = False
+    add_log(f"✅ [GIAI ĐOẠN 1 XONG] Mới={tong_moi} | Hủy={tong_huy} | Bỏ qua={tong_bo_qua}")
+    add_log("💡 Gợi ý: Gọi POST /bat-dau-realtime để bắt đầu Giai đoạn 2.")
+
+
+# ================================================================
+# GIAI ĐOẠN 2 — REALTIME JOB (APScheduler gọi mỗi 10 phút)
+# ================================================================
+def realtime_job():
+    """
+    Hàm này được APScheduler gọi tự động mỗi 10 phút.
+    Không cần vòng lặp while, không cần sleep — scheduler lo hết.
+    """
+    try:
+        today = datetime.now()
+        cleanup_old_data(days_to_keep=30)
+
+        # Áp dụng link tháng mới nếu đến tháng
+        pending = state["new_sheet_pending"]
+        if pending and today.month == pending["month"] and today.year == pending["year"]:
+            state["sheet_id"] = pending["sheet_id"]
+            state["sheet_month"] = pending["month"]
+            state["sheet_year"] = pending["year"]
+            state["new_sheet_pending"] = None
+            add_log(f"🎉 Chuyển sang tháng {pending['month']}/{pending['year']} thành công!")
+
+        # Kiểm tra hết tháng → tự dừng job, chờ cấu hình lại
+        if today.month != state["sheet_month"] or today.year != state["sheet_year"]:
+            add_log("🛑 Đã sang tháng mới! Tự dừng realtime. Gọi /config/sheet-moi rồi /bat-dau-realtime lại.")
+            scheduler.remove_job(REALTIME_JOB_ID)
+            return
+
+        danh_sach_ngay = tinh_danh_sach_ngay_realtime()
+        sheet_id = state["sheet_id"]
+
+        for ngay in danh_sach_ngay:
+            ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
+            tab = f"{ngay_obj.day}.{ngay_obj.month}"
+            create_sheet_if_not_exists(sheet_id, tab)
+            setup_header(sheet_id, tab)
+
+        add_log(f"📡 [REALTIME] Quét vùng: {', '.join(danh_sach_ngay)}")
+        emails = get_realtime_emails()
+        add_log(f"  📧 {len(emails)} email mới trong 10 phút qua.")
+
+        dm = dh = db = 0
+        for email in emails:
+            r = process_email(email, danh_sach_ngay, sheet_id, "realtime")
+            if r == "moi": dm += 1
+            elif r == "huy": dh += 1
+            else: db += 1
+
+        state["tong_moi"] += dm
+        state["tong_huy"] += dh
+        state["tong_bo_qua"] += db
+        state["lan_quet_cuoi"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        add_log(f"  ✔️  Kết quả: Mới={dm} | Hủy={dh} | Bỏ qua={db}")
+
+    except Exception as e:
+        add_log(f"⚠️ [REALTIME] Lỗi: {e}. APScheduler sẽ tự thử lại lần sau.")
+
+
+# ================================================================
+# FASTAPI APP
+# ================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    scheduler.start()
+    add_log("✅ Database & Scheduler khởi tạo xong. Sẵn sàng nhận lệnh.")
+    yield
+    scheduler.shutdown(wait=False)
+    add_log("🛑 Server tắt an toàn.")
+
+app = FastAPI(
+    title="BANA Booking Bot API",
+    description="API quản lý quét Gmail Klook & ghi Google Sheets",
+    version="3.0.0",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Cho phép mọi origin (dev). Production thì đổi lại.
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ================================================================
-# TRẠNG THÁI TOÀN CỤC (Global State)
+# SCHEMAS
 # ================================================================
-state = {
-    # Cấu hình
-    "current_sheet_id": None,
-    "sheet_month": None,
-    "sheet_year": None,
-    "ngay_bat_dau": None,
-    "so_ngay": 5,
-    "danh_sach_ngay": [],
-
-    # Link tháng mới đang chờ
-    "new_sheet_pending": None,  # {"sheet_id", "month", "year"}
-
-    # Trạng thái server
-    "server_running": False,
-    "server_thread": None,
-    "phase": "stopped",  # "stopped" | "backfill" | "realtime"
-
-    # Thống kê dashboard
-    "don_hom_nay": 0,
-    "da_ghi_sheets": 0,
-    "huy_ve": 0,
-    "next_scan_seconds": 0,  # Đếm ngược giây đến lần quét tiếp theo
-
-    # Danh sách đơn mới nhất (10 dòng)
-    "recent_bookings": [],
-
-    # Log terminal
-    "logs": [],
-}
-
-# Lock để tránh race condition
-state_lock = threading.Lock()
-
-# ================================================================
-# PYDANTIC MODELS (Request body)
-# ================================================================
-class StartRequest(BaseModel):
+class CauHinhBody(BaseModel):
     sheet_link: str
-    ngay_bat_dau: str       # "YYYY-MM-DD"
-    so_ngay: int = 5
+    ngay_bat_dau: str   # YYYY-MM-DD
+    so_ngay: int = 5    # 1-5
 
-class NewSheetRequest(BaseModel):
+class SheetMoiBody(BaseModel):
     sheet_link: str
 
 # ================================================================
-# HELPER FUNCTIONS
-# ================================================================
-def extract_sheet_id(url_or_id: str) -> str:
-    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url_or_id)
-    return match.group(1) if match else url_or_id.strip()
-
-def get_last_day_of_month(year: int, month: int) -> int:
-    return calendar.monthrange(year, month)[1]
-
-def get_danh_sach_ngay(ngay_bat_dau: datetime, so_ngay: int = 5):
-    result = []
-    for i in range(so_ngay):
-        d = ngay_bat_dau + timedelta(days=i)
-        result.append(d.strftime("%Y-%m-%d"))
-    return result
-
-def add_log(message: str, level: str = "info"):
-    """
-    Thêm log vào danh sách.
-    level: "info" | "success" | "error" | "warning"
-    """
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    log_entry = {
-        "time": timestamp,
-        "message": message,
-        "level": level,
-    }
-    with state_lock:
-        state["logs"].append(log_entry)
-        # Giữ tối đa 200 dòng log
-        if len(state["logs"]) > 200:
-            state["logs"] = state["logs"][-200:]
-
-def add_recent_booking(booking: dict, status: str = "new"):
-    """Thêm đơn vào danh sách recent (tối đa 50)"""
-    entry = {
-        "san_bay": booking.get("san_bay", ""),
-        "dich_vu": booking.get("dich_vu", ""),
-        "code": booking.get("code", ""),
-        "pax": booking.get("pax", ""),
-        "name": booking.get("name", ""),
-        "status": status,  # "new" | "cancelled"
-        "time": datetime.now().strftime("%H:%M:%S"),
-    }
-    with state_lock:
-        state["recent_bookings"].insert(0, entry)
-        if len(state["recent_bookings"]) > 50:
-            state["recent_bookings"] = state["recent_bookings"][:50]
-
-def reset_stats():
-    with state_lock:
-        state["don_hom_nay"] = 0
-        state["da_ghi_sheets"] = 0
-        state["huy_ve"] = 0
-        state["recent_bookings"] = []
-
-# ================================================================
-# LOGIC CHÍNH (Chạy trong background thread)
-# ================================================================
-def run_scanner():
-    """Hàm chạy ngầm: Vòng 1 quét bù + Vòng 2 realtime"""
-
-    add_log("🚀 Bắt đầu đồng bộ dữ liệu cũ...", "info")
-    with state_lock:
-        state["phase"] = "backfill"
-
-    # ---------- VÒNG 1: QUÉT BÙ ----------
-    danh_sach_ngay = state["danh_sach_ngay"][:]
-    current_sheet_id = state["current_sheet_id"]
-
-    for ngay_quet in danh_sach_ngay:
-        if not state["server_running"]:
-            return
-
-        ngay_obj = datetime.strptime(ngay_quet, "%Y-%m-%d")
-        auto_sheet_name = f"{ngay_obj.day}.{ngay_obj.month}"
-
-        create_sheet_if_not_exists(current_sheet_id, auto_sheet_name)
-        setup_header(current_sheet_id, auto_sheet_name)
-
-        emails_cu = get_emails_by_date(ngay_quet)
-        add_log(f"📨 Ngày {ngay_quet}: tìm thấy {len(emails_cu)} đơn cũ", "info")
-
-        for email in emails_cu:
-            if not state["server_running"]:
-                return
-
-            booking = parse_booking_email(email)
-            code = booking.get("code", "").upper()
-            if not code:
-                continue
-
-            is_canceled = "cancel" in email.get("subject", "").lower()
-            try:
-                is_exist, current_status = check_booking_exists(code)
-
-                if is_canceled:
-                    if is_exist and current_status != "CANCELLED":
-                        update_booking_status(code, "CANCELLED")
-                        update_sheet_booking_status(current_sheet_id, auto_sheet_name, code, "HỦY VÉ")
-                        add_log(f"🔴 HỦY VÉ (cũ): [{code}]", "error")
-                        with state_lock:
-                            state["huy_ve"] += 1
-                        add_recent_booking(booking, "cancelled")
-                    elif not is_exist:
-                        insert_booking(code, ngay_quet, status="CANCELLED")
-                        append_booking(booking, current_sheet_id, auto_sheet_name)
-                        update_sheet_booking_status(current_sheet_id, auto_sheet_name, code, "HỦY VÉ")
-                        add_log(f"🔴 HỦY SỚM (cũ): [{code}]", "error")
-                        with state_lock:
-                            state["huy_ve"] += 1
-                        add_recent_booking(booking, "cancelled")
-                else:
-                    if not is_exist:
-                        db_success = insert_booking(code, ngay_quet, status="BOOKED")
-                        if db_success:
-                            append_booking(booking, current_sheet_id, auto_sheet_name)
-                            add_log(f"✅ ĐƠN MỚI (cũ): [{code}] → Tab {auto_sheet_name}", "success")
-                            with state_lock:
-                                state["don_hom_nay"] += 1
-                                state["da_ghi_sheets"] += 1
-                            add_recent_booking(booking, "new")
-            except Exception as e:
-                add_log(f"⚠️ Lỗi quét bù [{code}]: {e}", "warning")
-
-    add_log("✅ Đồng bộ xong! Chuyển sang chế độ Realtime.", "success")
-    with state_lock:
-        state["phase"] = "realtime"
-
-    # ---------- VÒNG 2: REALTIME ----------
-    SLEEP_SECONDS = 300  # 5 phút
-
-    while state["server_running"]:
-        try:
-            today = datetime.now()
-            cleanup_old_data(days_to_keep=30)
-
-            # Áp dụng link tháng mới nếu đã đến tháng đó
-            _apply_new_sheet_if_ready(today)
-
-            # Kiểm tra hết tháng mà chưa có link mới
-            if _is_month_expired(today):
-                add_log("🛑 Đã sang tháng mới nhưng chưa có link Sheets! Tool tạm dừng.", "error")
-                with state_lock:
-                    state["phase"] = "waiting_new_sheet"
-                # Chờ cho đến khi có link mới
-                while state["server_running"] and _is_month_expired(datetime.now()):
-                    if state.get("new_sheet_pending"):
-                        break
-                    time.sleep(10)
-                continue
-
-            # Cảnh báo cuối tháng
-            _warn_end_of_month(today)
-
-            # Tính lại danh sách ngày (cửa sổ trượt)
-            sheet_month = state["sheet_month"]
-            sheet_year = state["sheet_year"]
-            last_day = get_last_day_of_month(sheet_year, sheet_month)
-            last_date = datetime(sheet_year, sheet_month, last_day)
-
-            ngay_bat_dau_obj = datetime.strptime(state["ngay_bat_dau"], "%Y-%m-%d")
-            start_date = max(today, ngay_bat_dau_obj)
-
-            danh_sach_ngay = []
-            for i in range(state["so_ngay"]):
-                d = start_date + timedelta(days=i)
-                if d > last_date:
-                    break
-                danh_sach_ngay.append(d.strftime("%Y-%m-%d"))
-
-            with state_lock:
-                state["danh_sach_ngay"] = danh_sach_ngay
-
-            current_sheet_id = state["current_sheet_id"]
-
-            # Tự tạo Tab mới nếu chưa có
-            for ngay in danh_sach_ngay:
-                ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
-                tab_name = f"{ngay_obj.day}.{ngay_obj.month}"
-                create_sheet_if_not_exists(current_sheet_id, tab_name)
-                setup_header(current_sheet_id, tab_name)
-
-            add_log(f"📡 Đang lắng nghe... Vùng: {', '.join(danh_sach_ngay)}", "info")
-
-            # Quét email realtime
-            realtime_emails = get_realtime_emails()
-
-            for email in realtime_emails:
-                booking = parse_booking_email(email)
-                code = booking.get("code", "").upper()
-                if not code:
-                    continue
-
-                ngay_di = booking.get("service_date", "").strip()
-                if ngay_di not in danh_sach_ngay:
-                    continue
-
-                ngay_obj = datetime.strptime(ngay_di, "%Y-%m-%d")
-                auto_sheet_name = f"{ngay_obj.day}.{ngay_obj.month}"
-                is_canceled = "cancel" in email.get("subject", "").lower()
-                is_exist, current_status = check_booking_exists(code)
-
-                if is_canceled:
-                    if is_exist and current_status != "CANCELLED":
-                        update_booking_status(code, "CANCELLED")
-                        update_sheet_booking_status(current_sheet_id, auto_sheet_name, code, "HỦY VÉ")
-                        add_log(f"🔴 HỦY VÉ: [{code}] → Tab {auto_sheet_name}", "error")
-                        with state_lock:
-                            state["huy_ve"] += 1
-                        add_recent_booking(booking, "cancelled")
-                    elif not is_exist:
-                        insert_booking(code, ngay_di, status="CANCELLED")
-                        append_booking(booking, current_sheet_id, auto_sheet_name)
-                        update_sheet_booking_status(current_sheet_id, auto_sheet_name, code, "HỦY VÉ")
-                        add_log(f"🔴 HỦY SỚM: [{code}] → Tab {auto_sheet_name}", "error")
-                        with state_lock:
-                            state["huy_ve"] += 1
-                        add_recent_booking(booking, "cancelled")
-                else:
-                    if not is_exist:
-                        db_success = insert_booking(code, ngay_di, status="BOOKED")
-                        if db_success:
-                            append_booking(booking, current_sheet_id, auto_sheet_name)
-                            add_log(f"✅ ĐƠN MỚI: [{code}] ngày {ngay_di} → Tab {auto_sheet_name}", "success")
-                            with state_lock:
-                                state["don_hom_nay"] += 1
-                                state["da_ghi_sheets"] += 1
-                            add_recent_booking(booking, "new")
-
-            # Đếm ngược 5 phút
-            for remaining in range(SLEEP_SECONDS, 0, -1):
-                if not state["server_running"]:
-                    return
-                with state_lock:
-                    state["next_scan_seconds"] = remaining
-                time.sleep(1)
-
-        except Exception as e:
-            add_log(f"⚠️ Lỗi: {e}. Thử lại sau 5 phút...", "warning")
-            time.sleep(SLEEP_SECONDS)
-
-    add_log("🛑 Server đã dừng an toàn.", "info")
-    with state_lock:
-        state["phase"] = "stopped"
-        state["server_running"] = False
-
-def _apply_new_sheet_if_ready(today: datetime):
-    pending = state.get("new_sheet_pending")
-    if not pending:
-        return
-    if today.month == pending["month"] and today.year == pending["year"]:
-        with state_lock:
-            state["current_sheet_id"] = pending["sheet_id"]
-            state["sheet_month"] = pending["month"]
-            state["sheet_year"] = pending["year"]
-            state["new_sheet_pending"] = None
-        add_log(f"🎉 Đã chuyển sang Sheets tháng {pending['month']}/{pending['year']}!", "success")
-
-def _is_month_expired(today: datetime) -> bool:
-    return (
-        today.month != state["sheet_month"] or
-        today.year != state["sheet_year"]
-    ) and state["new_sheet_pending"] is None
-
-def _warn_end_of_month(today: datetime):
-    sheet_month = state["sheet_month"]
-    sheet_year = state["sheet_year"]
-    if today.month != sheet_month or today.year != sheet_year:
-        return
-    last_day = get_last_day_of_month(sheet_year, sheet_month)
-    days_left = last_day - today.day
-    if 0 <= days_left <= 2:
-        add_log(
-            f"⚠️ Còn {days_left + 1} ngày hết tháng {sheet_month}/{sheet_year}! Chuẩn bị link mới!",
-            "warning"
-        )
-
-# ================================================================
-# API ENDPOINTS
+# ENDPOINTS
 # ================================================================
 
-@app.get("/")
+@app.get("/", summary="Kiểm tra server sống")
 def root():
-    return {"status": "Klook Scanner API đang chạy"}
+    return {"status": "ok", "message": "BANA Booking Bot v3 đang chạy 🤖"}
 
 
-@app.post("/api/start")
-def start_server(req: StartRequest):
-    """Khởi động scanner"""
-    if state["server_running"]:
-        return {"success": False, "message": "Server đang chạy rồi!"}
+# ----------------------------------------------------------------
+# BƯỚC 0: Cấu hình chung (sheet + ngày) — gọi trước mọi thứ
+# ----------------------------------------------------------------
+@app.post("/cau-hinh", summary="Cấu hình sheet và ngày bắt đầu")
+def cau_hinh(body: CauHinhBody):
+    """
+    Lưu cấu hình sheet + ngày. Phải gọi trước /quet-bu và /bat-dau-realtime.
+    Không khởi động gì cả, chỉ lưu config.
+    """
+    if state["dang_quet_bu"]:
+        raise HTTPException(status_code=400, detail="Đang quét bù! Chờ xong rồi cấu hình lại.")
+    if is_realtime_running():
+        raise HTTPException(status_code=400, detail="Realtime đang chạy! Gọi /dung-realtime trước.")
 
-    # Validate ngày
     try:
-        ngay_bat_dau_obj = datetime.strptime(req.ngay_bat_dau, "%Y-%m-%d")
+        ngay_bat_dau_obj = datetime.strptime(body.ngay_bat_dau.replace("/", "-"), "%Y-%m-%d")
     except ValueError:
-        return {"success": False, "message": "Ngày không đúng định dạng YYYY-MM-DD"}
+        raise HTTPException(status_code=400, detail="Sai định dạng ngày! Dùng YYYY-MM-DD")
 
-    # Validate số ngày
-    so_ngay = max(1, min(req.so_ngay, 5))  # Tối thiểu 1, tối đa 5
+    if not 1 <= body.so_ngay <= 5:
+        raise HTTPException(status_code=400, detail="so_ngay phải từ 1 đến 5")
 
-    sheet_id = extract_sheet_id(req.sheet_link)
-    if not sheet_id:
-        return {"success": False, "message": "Link Sheets không hợp lệ"}
+    state["sheet_id"] = extract_sheet_id(body.sheet_link)
+    state["sheet_month"] = ngay_bat_dau_obj.month
+    state["sheet_year"] = ngay_bat_dau_obj.year
+    state["ngay_bat_dau"] = ngay_bat_dau_obj
+    state["so_ngay"] = body.so_ngay
+    state["tong_moi"] = state["tong_huy"] = state["tong_bo_qua"] = 0
+    state["log"] = []
 
-    # Khởi tạo DB
-    init_db()
-
-    # Reset state
-    reset_stats()
-
-    danh_sach_ngay = get_danh_sach_ngay(ngay_bat_dau_obj, so_ngay)
-
-    with state_lock:
-        state["current_sheet_id"] = sheet_id
-        state["sheet_month"] = ngay_bat_dau_obj.month
-        state["sheet_year"] = ngay_bat_dau_obj.year
-        state["ngay_bat_dau"] = req.ngay_bat_dau
-        state["so_ngay"] = so_ngay
-        state["danh_sach_ngay"] = danh_sach_ngay
-        state["server_running"] = True
-        state["phase"] = "backfill"
-        state["logs"] = []
-
-    # Chạy ngầm
-    t = threading.Thread(target=run_scanner, daemon=True)
-    t.start()
-
-    with state_lock:
-        state["server_thread"] = t
-
-    add_log(f"🚀 Server khởi động! Vùng: {', '.join(danh_sach_ngay)}", "success")
-
+    add_log(f"⚙️ Đã cấu hình: sheet={state['sheet_id']} | ngày={body.ngay_bat_dau} | so_ngay={body.so_ngay}")
     return {
-        "success": True,
-        "message": "Server đã khởi động!",
-        "danh_sach_ngay": danh_sach_ngay,
+        "status": "configured",
+        "sheet_id": state["sheet_id"],
+        "ngay_bat_dau": body.ngay_bat_dau,
+        "so_ngay": body.so_ngay,
+        "buoc_tiep_theo": "Gọi POST /quet-bu để quét bù, hoặc POST /bat-dau-realtime để bắt đầu realtime ngay."
     }
 
 
-@app.post("/api/stop")
-def stop_server():
-    """Dừng scanner"""
-    if not state["server_running"]:
-        return {"success": False, "message": "Server chưa chạy"}
-
-    with state_lock:
-        state["server_running"] = False
-        state["phase"] = "stopped"
-
-    add_log("🛑 Đã gửi lệnh dừng server.", "warning")
-    return {"success": True, "message": "Đang dừng server..."}
-
-
-@app.post("/api/new-sheet")
-def save_new_sheet(req: NewSheetRequest):
-    """Lưu link Sheets tháng mới vào hàng chờ"""
-    if not state["current_sheet_id"]:
-        return {"success": False, "message": "Chưa có server đang chạy"}
-
-    new_id = extract_sheet_id(req.sheet_link)
-
-    # Không cho nhập link cũ
-    if new_id == state["current_sheet_id"]:
-        return {"success": False, "message": "Đây là link cũ! Vui lòng nhập link tháng mới."}
-
-    # Tính tháng mới
-    current_month = state["sheet_month"]
-    current_year = state["sheet_year"]
-    if current_month == 12:
-        next_month, next_year = 1, current_year + 1
-    else:
-        next_month, next_year = current_month + 1, current_year
-
-    with state_lock:
-        state["new_sheet_pending"] = {
-            "sheet_id": new_id,
-            "month": next_month,
-            "year": next_year,
-        }
-
-    add_log(f"💾 Đã lưu link tháng {next_month}/{next_year}. Tự kích hoạt lúc 00:00 ngày 1/{next_month}.", "success")
-
-    return {
-        "success": True,
-        "message": f"Đã lưu! Link sẽ kích hoạt ngày 1/{next_month}/{next_year}",
-        "next_month": next_month,
-        "next_year": next_year,
-    }
-
-
-@app.get("/api/status")
-def get_status():
-    """Trả về toàn bộ trạng thái hiện tại cho UI poll"""
-    today = datetime.now()
-    sheet_month = state["sheet_month"] or today.month
-    sheet_year = state["sheet_year"] or today.year
-    last_day = get_last_day_of_month(sheet_year, sheet_month)
-    days_left = last_day - today.day if today.month == sheet_month else 0
-
-    return {
-        # Server
-        "server_running": state["server_running"],
-        "phase": state["phase"],
-
-        # Cấu hình
-        "current_sheet_id": state["current_sheet_id"],
-        "sheet_month": state["sheet_month"],
-        "sheet_year": state["sheet_year"],
-        "ngay_bat_dau": state["ngay_bat_dau"],
-        "so_ngay": state["so_ngay"],
-        "danh_sach_ngay": state["danh_sach_ngay"],
-
-        # Link tháng mới
-        "new_sheet_pending": state["new_sheet_pending"],
-
-        # Thống kê
-        "don_hom_nay": state["don_hom_nay"],
-        "da_ghi_sheets": state["da_ghi_sheets"],
-        "huy_ve": state["huy_ve"],
-        "next_scan_seconds": state["next_scan_seconds"],
-
-        # Cảnh báo cuối tháng
-        "days_left_in_month": days_left,
-        "warn_end_of_month": 0 <= days_left <= 2 and today.month == sheet_month,
-
-        # Đơn gần nhất
-        "recent_bookings": state["recent_bookings"][:10],
-    }
-
-
-@app.get("/api/logs")
-def get_logs(limit: int = 50):
-    """Trả về log gần nhất"""
-    logs = state["logs"]
-    return {"logs": logs[-limit:]}
-
-
-@app.get("/api/logs/stream")
-async def stream_logs():
+# ----------------------------------------------------------------
+# BƯỚC 1: Giai đoạn 1 — Quét bù (chạy 1 lần)
+# ----------------------------------------------------------------
+@app.post("/quet-bu", summary="[Giai đoạn 1] Quét bù email lịch sử")
+def bat_dau_quet_bu(background_tasks: BackgroundTasks):
     """
-    Server-Sent Events: UI subscribe để nhận log realtime
-    Dùng: EventSource('/api/logs/stream') trong JS
+    Chạy quét bù 1 lần duy nhất dựa trên cấu hình đã lưu.
+    Không tự động chuyển sang Giai đoạn 2 — bạn tự quyết định.
     """
-    async def event_generator():
-        last_index = len(state["logs"])
-        while True:
-            await asyncio.sleep(1)
-            current_logs = state["logs"]
-            if len(current_logs) > last_index:
-                new_logs = current_logs[last_index:]
-                for log in new_logs:
-                    yield f"data: {json.dumps(log, ensure_ascii=False)}\n\n"
-                last_index = len(current_logs)
+    if not state["sheet_id"]:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình! Gọi POST /cau-hinh trước.")
+    if state["dang_quet_bu"]:
+        raise HTTPException(status_code=400, detail="Đang quét bù rồi!")
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        }
+    background_tasks.add_task(chay_quet_bu)
+    return {
+        "status": "started",
+        "message": "Giai đoạn 1 đang chạy trong nền.",
+        "buoc_tiep_theo": "Theo dõi qua GET /trang-thai. Khi xong, gọi POST /bat-dau-realtime."
+    }
+
+
+# ----------------------------------------------------------------
+# BƯỚC 2: Giai đoạn 2 — Realtime (APScheduler)
+# ----------------------------------------------------------------
+@app.post("/bat-dau-realtime", summary="[Giai đoạn 2] Bắt đầu quét realtime mỗi 10 phút")
+def bat_dau_realtime():
+    """
+    Đăng ký job realtime với APScheduler (chạy mỗi 10 phút).
+    Có thể gọi độc lập, không cần chạy /quet-bu trước.
+    """
+    if not state["sheet_id"]:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình! Gọi POST /cau-hinh trước.")
+    if state["dang_quet_bu"]:
+        raise HTTPException(status_code=400, detail="Đang quét bù! Chờ xong rồi bắt đầu realtime.")
+    if is_realtime_running():
+        raise HTTPException(status_code=400, detail="Realtime đang chạy rồi!")
+
+    # Thêm job interval, chạy ngay lần đầu (next_run_time=now)
+    scheduler.add_job(
+        realtime_job,
+        trigger="interval",
+        minutes=REALTIME_INTERVAL_MINUTES,
+        id=REALTIME_JOB_ID,
+        next_run_time=datetime.now(),   # Chạy ngay lập tức lần đầu
+        replace_existing=True,
     )
+    add_log("🟢 [GIAI ĐOẠN 2] Realtime job đã được đăng ký (mỗi 10 phút).")
+    return {
+        "status": "started",
+        "interval_minutes": REALTIME_INTERVAL_MINUTES,
+        "message": "Realtime đang chạy. Gọi POST /dung-realtime để dừng."
+    }
 
 
-@app.delete("/api/logs")
-def clear_logs():
-    """Xóa toàn bộ log"""
-    with state_lock:
-        state["logs"] = []
-    return {"success": True}
+@app.post("/dung-realtime", summary="[Giai đoạn 2] Dừng realtime ngay lập tức")
+def dung_realtime():
+    """
+    Dừng job realtime ngay — không cần chờ hết chu kỳ 10 phút.
+    Sau đó có thể gọi /bat-dau-realtime lại bất kỳ lúc nào.
+    """
+    if not is_realtime_running():
+        raise HTTPException(status_code=400, detail="Realtime chưa chạy.")
+
+    scheduler.remove_job(REALTIME_JOB_ID)
+    add_log("🛑 Realtime job đã dừng.")
+    return {
+        "status": "stopped",
+        "message": "Đã dừng realtime ngay lập tức. Gọi /bat-dau-realtime để chạy lại."
+    }
 
 
-# ================================================================
-# CHẠY SERVER
-# ================================================================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+@app.post("/tam-dung-realtime", summary="Tạm dừng realtime (giữ lịch)")
+def tam_dung_realtime():
+    """
+    Tạm dừng job — APScheduler giữ lịch nhưng không thực thi.
+    Dùng /tiep-tuc-realtime để đánh thức lại.
+    """
+    job = scheduler.get_job(REALTIME_JOB_ID)
+    if not job:
+        raise HTTPException(status_code=400, detail="Realtime chưa chạy.")
+
+    scheduler.pause_job(REALTIME_JOB_ID)
+    add_log("⏸️ Realtime job đã tạm dừng.")
+    return {"status": "paused", "message": "Đã tạm dừng. Gọi /tiep-tuc-realtime để tiếp tục."}
+
+
+@app.post("/tiep-tuc-realtime", summary="Tiếp tục realtime sau tạm dừng")
+def tiep_tuc_realtime():
+    """Đánh thức job đã bị pause — tiếp tục theo lịch cũ."""
+    job = scheduler.get_job(REALTIME_JOB_ID)
+    if not job:
+        raise HTTPException(status_code=400, detail="Realtime chưa được đăng ký. Gọi /bat-dau-realtime.")
+
+    scheduler.resume_job(REALTIME_JOB_ID)
+    add_log("▶️ Realtime job đã tiếp tục.")
+    return {"status": "resumed", "message": "Bot đã tiếp tục quét."}
+
+
+# ----------------------------------------------------------------
+# TIỆN ÍCH
+# ----------------------------------------------------------------
+@app.get("/trang-thai", summary="Xem trạng thái hiện tại")
+def trang_thai():
+    job = scheduler.get_job(REALTIME_JOB_ID)
+    realtime_status = "stopped"
+    next_run = None
+    if job:
+        realtime_status = "paused" if job.next_run_time is None else "running"
+        next_run = job.next_run_time.strftime("%Y-%m-%d %H:%M:%S") if job.next_run_time else None
+
+    return {
+        "giai_doan_1": {
+            "dang_quet_bu": state["dang_quet_bu"],
+        },
+        "giai_doan_2": {
+            "trang_thai": realtime_status,          # "running" | "paused" | "stopped"
+            "lan_chay_tiep_theo": next_run,
+            "lan_quet_cuoi": state["lan_quet_cuoi"],
+        },
+        "cau_hinh": {
+            "sheet_id": state["sheet_id"],
+            "sheet_thang_nam": f"{state['sheet_month']}/{state['sheet_year']}" if state["sheet_month"] else None,
+            "ngay_bat_dau": state["ngay_bat_dau"].strftime("%Y-%m-%d") if state["ngay_bat_dau"] else None,
+            "so_ngay": state["so_ngay"],
+            "link_sheets_moi_cho": state["new_sheet_pending"]["sheet_id"] if state["new_sheet_pending"] else None,
+        },
+        "thong_ke": {
+            "tong_don_moi": state["tong_moi"],
+            "tong_huy": state["tong_huy"],
+            "tong_bo_qua": state["tong_bo_qua"],
+        },
+    }
+
+
+@app.get("/log", summary="Xem log gần nhất")
+def xem_log(n: int = 100):
+    return {"log": state["log"][-n:]}
+
+
+@app.post("/quet-ngay", summary="Quét thủ công 1 ngày cụ thể")
+def quet_thu_cong(ngay: str, background_tasks: BackgroundTasks):
+    """Quét bù thủ công cho 1 ngày bất kỳ (YYYY-MM-DD)."""
+    if not state["sheet_id"]:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình! Gọi POST /cau-hinh trước.")
+    try:
+        datetime.strptime(ngay, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Sai định dạng ngày! Dùng YYYY-MM-DD")
+
+    def _quet():
+        sheet_id = state["sheet_id"]
+        ngay_obj = datetime.strptime(ngay, "%Y-%m-%d")
+        tab = f"{ngay_obj.day}.{ngay_obj.month}"
+        create_sheet_if_not_exists(sheet_id, tab)
+        setup_header(sheet_id, tab)
+        ids = lay_danh_sach_id_email(ngay)
+        add_log(f"🔧 [QUÉT THỦ CÔNG] Ngày {ngay}: {len(ids)} email")
+        if not ids:
+            return
+        service = get_google_service("gmail", "v1")
+        for msg in ids:
+            email = tai_chi_tiet_mot_email(service, msg["id"])
+            if email:
+                process_email(email, [ngay], sheet_id, "thu_cong")
+
+    background_tasks.add_task(_quet)
+    return {"status": "queued", "ngay": ngay, "message": f"Đang quét ngày {ngay} trong nền..."}
+
+
+@app.post("/config/sheet-moi", summary="Đăng ký link Sheets tháng mới")
+def cap_nhat_sheet_moi(body: SheetMoiBody):
+    """
+    Đăng ký link Sheets cho tháng tiếp theo.
+    Realtime job sẽ tự động chuyển sang link này khi sang tháng mới.
+    """
+    if not state["sheet_month"]:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình!")
+
+    cur_month = state["sheet_month"]
+    cur_year = state["sheet_year"]
+    next_month = 1 if cur_month == 12 else cur_month + 1
+    next_year = cur_year + 1 if cur_month == 12 else cur_year
+
+    new_id = extract_sheet_id(body.sheet_link)
+    if new_id == state["sheet_id"]:
+        raise HTTPException(status_code=400, detail="Đây là link cũ! Nhập link của tháng mới.")
+
+    state["new_sheet_pending"] = {
+        "sheet_id": new_id,
+        "month": next_month,
+        "year": next_year,
+    }
+    add_log(f"📋 Đã đăng ký link Sheets mới cho tháng {next_month}/{next_year}")
+    return {
+        "status": "ok",
+        "message": f"Link đã lưu. Sẽ kích hoạt tự động khi sang tháng {next_month}/{next_year}.",
+        "sheet_id_moi": new_id,
+    }

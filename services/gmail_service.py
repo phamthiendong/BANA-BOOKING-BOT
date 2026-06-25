@@ -3,7 +3,7 @@
 import os
 import base64
 from bs4 import BeautifulSoup
-
+import time
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -157,12 +157,22 @@ def get_realtime_emails():
     service = get_google_service("gmail", "v1")
     emails = []
 
+    # Lấy thời gian hiện tại trừ đi 900 giây (15 phút) để làm vùng đệm an toàn
+    time_window_ago = int(time.time()) - 900
+
     # newer_than:10m lọc siêu tốc trên cụm máy chủ Google, không phân biệt ngày đi bên trong thư
+    # gmail_query = (
+    #     'from:operator@klook.com '
+    #     '(subject:"Klook order confirmed" OR subject:"Klook order canceled") '
+    #     'subject:(Fast Track) '
+    #     'newer_than:10m'
+    # )
+
     gmail_query = (
-        'from:operator@klook.com '
-        '(subject:"Klook order confirmed" OR subject:"Klook order canceled") '
-        'subject:(Fast Track) '
-        'newer_than:10m'
+        f'from:operator@klook.com '
+        f'(subject:"Klook order confirmed" OR subject:"Klook order canceled") '
+        f'subject:(Fast Track) '
+        f'after:{time_window_ago}'
     )
 
     result = service.users().messages().list(
